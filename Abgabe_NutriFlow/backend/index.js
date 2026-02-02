@@ -104,7 +104,8 @@ async function fetchNutritionBulk(ids, budgetRef, stats) {
   const all = [];
   for (const chunk of chunks) {
     if (budgetRef && budgetRef.remaining <= 0) {
-      throw new Error("BUDGET_EXCEEDED");
+      console.warn("Spoonacular budget exceeded during nutrition bulk");
+      break;
     }
     if (budgetRef) budgetRef.remaining -= 1;
     if (stats) stats.bulkCalls += 1;
@@ -265,32 +266,42 @@ async function fetchRecipesByAvailableFoods(availableFoods, isVegetarian, number
 async function createDummyWeekPlan(config) {
   const TRAINING_BUFFER = 120; // 2 Stunden
   const WEEKDAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const MAX_API_CALLS = 25;
-  const MAX_RANDOM_CALLS_PER_DAY = 3;
-  const MAX_COMPLEX_CALLS_PER_DAY = 2;
-  const isVegetarian = config.isVegetarian === true;
-  let vegetarianFallbackUsed = false;
-  let vegetarianPoolCount = 0;
-  let vegetarianShortfallWarned = false;
-  const nutritionLogContext = { nutritionShapeLogged: false };
+  const MAX_CALLS_PER_REQUEST = 10;
+  const MAX_COMPLEX_CALLS = 2;
+  const MAX_POOL_SIZE = 80;
 
-function timeToMinutes(t) {
+  const isVegetarian = config.isVegetarian === true;
+  const includeSnack = Boolean(config.includeSnack);
+  const availableFoods = Array.isArray(config.availableFoods)
+    ? config.availableFoods
+    : (Array.isArray(config.inventory) ? config.inventory : []);
+  const availableFoodsCount = availableFoods.length;
+
+  console.log("Weekly plan request", {
+    isVegetarian,
+    availableFoodsCount,
+    mealsPerDay: Number(config.mealsPerDay) || 0,
+    weeksCount: Number(config.weeksCount) || 1,
+    includeSnack
+  });
+
+  function timeToMinutes(t) {
     const [hh, mm] = (t || "").split(":").map(Number);
     return Number.isFinite(hh) && Number.isFinite(mm) ? hh * 60 + mm : null;
   }
 
-function isValidTimeString(t) {
+  function isValidTimeString(t) {
     return typeof t === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(t) && t !== "00:00";
   }
 
-function minutesToTime(mins) {
+  function minutesToTime(mins) {
     const clamped = Math.max(0, Math.min(23 * 60 + 59, Math.round(mins)));
     const hh = String(Math.floor(clamped / 60)).padStart(2, "0");
     const mm = String(clamped % 60).padStart(2, "0");
     return `${hh}:${mm}`;
   }
 
-function parseStartDate(value) {
+  function parseStartDate(value) {
     if (!value || typeof value !== "string") return null;
     const match = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
     if (!match) return null;
@@ -301,22 +312,23 @@ function parseStartDate(value) {
     return new Date(Date.UTC(year, month, day));
   }
 
-function formatDateUTC(date) {
+  function formatDateUTC(date) {
     const y = date.getUTCFullYear();
     const m = String(date.getUTCMonth() + 1).padStart(2, "0");
     const d = String(date.getUTCDate()).padStart(2, "0");
     return `${y}-${m}-${d}`;
   }
 
-function addDaysUTC(date, days) {
+  function addDaysUTC(date, days) {
     const next = new Date(date);
     next.setUTCDate(next.getUTCDate() + days);
     return next;
   }
 
-function generateMealTimes(count) {
+  function generateMealTimes(count) {
     const start = 8 * 60;
     const end = 20 * 60;
+    if (!Number.isFinite(count) || count <= 0) return [];
     if (count === 1) return ["12:00"];
 
     const interval = (end - start) / (count - 1);
@@ -336,8 +348,33 @@ function generateMealTimes(count) {
     return { date, dateISO: formatDateUTC(date), dayAbbr };
   });
 
-  const usedRecipeIdsGlobal = new Set();
-  let requestBudget = MAX_API_CALLS;
+  const dayConfigs = planDays.map(planDay => {
+    const abbr = planDay.dayAbbr;
+    const trainingTimeStr = config.trainingTime?.[abbr] ?? null;
+    const isTrainingDay = Array.isArray(config.trainingDays)
+      && config.trainingDays.includes(abbr)
+      && isValidTimeString(trainingTimeStr);
+    const trainingMins = isTrainingDay ? timeToMinutes(trainingTimeStr) : null;
+    const rawTimes = generateMealTimes(Number(config.mealsPerDay));
+    const mealTimes = rawTimes.filter(t => {
+      if (!isTrainingDay) return true;
+      const mins = timeToMinutes(t);
+      return mins < trainingMins || mins >= trainingMins + TRAINING_BUFFER;
+    });
+    const totalMeals = mealTimes.length + (includeSnack ? 1 : 0);
+    return {
+      ...planDay,
+      mealTimes,
+      totalMeals,
+      isTrainingDay,
+      trainingMins
+    };
+  });
+
+  const neededTotalMeals = dayConfigs.reduce((sum, day) => sum + Math.max(0, day.totalMeals), 0);
+  const poolTarget = Math.min(MAX_POOL_SIZE, Math.max(neededTotalMeals * 3, neededTotalMeals));
+
+  let requestBudget = MAX_CALLS_PER_REQUEST;
   const budgetRef = {
     get remaining() {
       return requestBudget;
@@ -347,400 +384,238 @@ function generateMealTimes(count) {
     }
   };
 
+  const poolById = new Map();
+  const poolList = [];
+
+  const addToPool = (recipes) => {
+    (recipes || []).forEach(recipe => {
+      if (!recipe?.id) return;
+      if (poolById.has(recipe.id)) return;
+      poolById.set(recipe.id, recipe);
+      poolList.push(recipe);
+    });
+  };
+
+  const useComplexSearch = availableFoodsCount >= 4;
+  if (useComplexSearch && poolTarget > 0) {
+    for (let i = 0; i < MAX_COMPLEX_CALLS; i++) {
+      if (poolList.length >= poolTarget) break;
+      if (budgetRef.remaining <= 0) break;
+      const remaining = poolTarget - poolList.length;
+      const batchSize = Math.min(30, Math.max(8, Math.ceil(remaining / 2)));
+      const batch = await fetchRecipesByAvailableFoods(availableFoods, isVegetarian, batchSize, budgetRef);
+      addToPool(batch);
+    }
+  }
+
+  const nutritionById = new Map();
+  const hydrateIntoMap = async (recipes) => {
+    const ids = uniqueArray((recipes || []).map(r => r?.id).filter(Boolean))
+      .filter(id => !nutritionById.has(id));
+    if (!ids.length || budgetRef.remaining <= 0) return;
+    const info = await fetchNutritionBulk(ids, budgetRef);
+    info.forEach(recipe => {
+      if (recipe?.id) nutritionById.set(recipe.id, recipe);
+    });
+  };
+
+  await hydrateIntoMap(poolList);
+
+  const buildHydratedPool = (recipes) => (recipes || []).map(recipe => {
+    const infoRecipe = nutritionById.get(recipe?.id);
+    const macros = extractNutritionMacros(infoRecipe?.nutrition ?? infoRecipe);
+    if (!macros) return null;
+    const vegetarian = infoRecipe?.vegetarian ?? recipe?.vegetarian;
+    if (isVegetarian && vegetarian !== true) return null;
+    return {
+      ...recipe,
+      vegetarian,
+      nutritionData: macros
+    };
+  }).filter(Boolean);
+
+  let hydratedPool = buildHydratedPool(poolList);
+
+  if (hydratedPool.length < neededTotalMeals && budgetRef.remaining > 0) {
+    const missing = neededTotalMeals - hydratedPool.length;
+    const toFetch = Math.min(20, Math.max(missing * 2, 6));
+    if (toFetch > 0) {
+      const randomBatch = await fetchRandomRecipes(toFetch, isVegetarian, budgetRef);
+      addToPool(randomBatch);
+      await hydrateIntoMap(randomBatch);
+      hydratedPool = buildHydratedPool(poolList);
+    }
+  }
+
+  const callsUsed = MAX_CALLS_PER_REQUEST - budgetRef.remaining;
+  console.log("Pool built", {
+    poolSize: poolList.length,
+    hydratedCount: hydratedPool.length,
+    callsUsed
+  });
+
+  const hydratedCandidates = hydratedPool.map(recipe => {
+    const pantryMatches = availableFoods.length ? computePantryMatches(recipe, availableFoods) : [];
+    return {
+      recipe,
+      pantryMatches,
+      pantryMatchCount: pantryMatches.length
+    };
+  });
+
+  const usedRecipeIdsGlobal = new Set();
   const weekPlan = [];
+  let mealsTotal = 0;
 
-  const generateDayPlan = async (planDay) => {
-    try {
-      const meals = [];
-
-      /* ───────── TRAINING INFO (EINMAL!) ───────── */
-      const abbr = planDay.dayAbbr;
-      const trainingTimeStr = config.trainingTime?.[abbr] ?? null;
-      const isTrainingDay = Array.isArray(config.trainingDays)
-        && config.trainingDays.includes(abbr)
-        && isValidTimeString(trainingTimeStr);
-      const trainingMins = isTrainingDay ? timeToMinutes(trainingTimeStr) : null;
-
-      /* ───────── MEAL TIMES ───────── */
-      const rawTimes = generateMealTimes(Number(config.mealsPerDay));
-
-      const mealTimes = rawTimes.filter(t => {
-        if (!isTrainingDay) return true;
-        const mins = timeToMinutes(t);
-        return mins < trainingMins || mins >= trainingMins + TRAINING_BUFFER;
-      });
-
-      /* ───────── DAILY TARGETS ───────── */
-      const dailyCalories = Number(config.calories) || 0;
-      const dailyProtein = Number(config.protein) || 0;
-      const dailyCarbs = Number(config.carbs) || 0;
-      const dailyFat = Number(config.fat) || 0;
-
-      /* ───────── FETCH RECIPES FROM SPOONACULAR ───────── */
-      const includeSnack = Boolean(config.includeSnack);
-      const neededMeals = mealTimes.length + (includeSnack ? 1 : 0);
-      const availableFoods = Array.isArray(config.availableFoods)
-        ? config.availableFoods
-        : (Array.isArray(config.inventory) ? config.inventory : []);
-      const availableFoodsCount = availableFoods.length;
-      const useComplexSearch = availableFoodsCount >= 4;
-      const totalMealsToday = Math.max(1, neededMeals);
-      const perMealTargets = {
-        calories: dailyCalories ? Math.round(dailyCalories / totalMealsToday) : 0,
-        protein: dailyProtein ? Math.round(dailyProtein / totalMealsToday) : 0,
-        carbs: dailyCarbs ? Math.round(dailyCarbs / totalMealsToday) : 0,
-        fat: dailyFat ? Math.round(dailyFat / totalMealsToday) : 0
-      };
-      let selectedRecipes = [];
-      const seenIds = new Set();
-      const MAX_ATTEMPTS = 3;
-      let attempts = 0;
-      let batchSize = Math.min(20, Math.max(neededMeals * 3, 8));
-      let fetchedCandidates = 0;
-      let afterVegetarian = 0;
-      let afterHydrateNutrition = 0;
-      let afterDedupe = 0;
-      let filledFromRandomCount = 0;
-      const dayCallStats = { randomCalls: 0, complexCalls: 0, bulkCalls: 0 };
-      let budgetExceeded = false;
-
-      const scoreBatch = (batch) => batch.map(r => {
-        const pantryMatches = availableFoods.length ? computePantryMatches(r, availableFoods) : [];
-        const nutritionDistance = nutritionDistanceScore(r.nutritionData, perMealTargets);
-        const score = pantryMatches.length * 2 - nutritionDistance;
+  const selectRecipesForDay = (perMealTargets, needed) => {
+    if (!needed) return { selected: [], reuseCount: 0 };
+    const baseScored = hydratedCandidates
+      .filter(entry => entry?.recipe?.id && entry?.recipe?.nutritionData)
+      .map(entry => {
+        const nutritionDistance = nutritionDistanceScore(entry.recipe.nutritionData, perMealTargets);
         return {
-          recipe: r,
-          pantryMatches,
-          pantryMatchCount: pantryMatches.length,
+          ...entry,
           nutritionDistance,
-          score
+          score: entry.pantryMatchCount * 2 - nutritionDistance
         };
-      }).sort((a, b) => b.score - a.score);
+      })
+      .sort((a, b) => b.score - a.score);
 
-      const addScoredEntries = (batch, allowGlobalDedupe = false) => {
-        const scored = scoreBatch(batch);
-        for (const entry of scored) {
-          const id = entry.recipe?.id;
-          if (!id || seenIds.has(id)) continue;
-          if (!allowGlobalDedupe && usedRecipeIdsGlobal.has(id)) continue;
-          selectedRecipes.push(entry);
-          seenIds.add(id);
-          usedRecipeIdsGlobal.add(id);
-          if (selectedRecipes.length >= neededMeals) break;
-        }
-      };
+    const selected = [];
+    const selectedIds = new Set();
+    let reuseCount = 0;
 
-      try {
-        while (selectedRecipes.length < neededMeals && attempts < MAX_ATTEMPTS) {
-          if (budgetRef.remaining <= 0) {
-            budgetExceeded = true;
-            break;
-          }
-          let batch = [];
-          if (useComplexSearch) {
-            if (dayCallStats.complexCalls >= MAX_COMPLEX_CALLS_PER_DAY) break;
-            batch = await fetchRecipesByAvailableFoods(availableFoods, isVegetarian, Math.round(batchSize), budgetRef, dayCallStats);
-          } else {
-            if (dayCallStats.randomCalls >= MAX_RANDOM_CALLS_PER_DAY) break;
-            batch = await fetchRandomRecipes(Math.round(batchSize), isVegetarian, budgetRef, dayCallStats);
-            vegetarianFallbackUsed = true;
-          }
+    // First pass: unique across the week
+    for (const entry of baseScored) {
+      if (selected.length >= needed) break;
+      const id = entry.recipe.id;
+      if (usedRecipeIdsGlobal.has(id)) continue;
+      if (selectedIds.has(id)) continue;
+      selected.push(entry);
+      selectedIds.add(id);
+      usedRecipeIdsGlobal.add(id);
+    }
 
-          fetchedCandidates += batch.length;
-          const vegetarianBatch = filterVegetarian(batch, isVegetarian);
-          afterVegetarian += vegetarianBatch.length;
-          const hydratedBatch = await hydrateNutrition(vegetarianBatch, isVegetarian, nutritionLogContext, budgetRef, dayCallStats);
-          afterHydrateNutrition += hydratedBatch.length;
-          const nutritionReady = hydratedBatch.filter(r => r?.nutritionData);
+    // Relax pass: allow reuse across the week
+    if (selected.length < needed) {
+      for (const entry of baseScored) {
+        if (selected.length >= needed) break;
+        const id = entry.recipe.id;
+        if (selectedIds.has(id)) continue;
+        selected.push(entry);
+        selectedIds.add(id);
+        reuseCount += 1;
+      }
+    }
 
-          const deduped = nutritionReady.filter(r => r?.id && !seenIds.has(r.id) && !usedRecipeIdsGlobal.has(r.id));
-          afterDedupe += deduped.length;
+    return { selected, reuseCount };
+  };
 
-          if (!deduped.length) {
-            attempts += 1;
-            batchSize = Math.min(20, Math.ceil(batchSize * 1.5));
-            continue;
-          }
+  for (const day of dayConfigs) {
+    const meals = [];
+    const dailyCalories = Number(config.calories) || 0;
+    const dailyProtein = Number(config.protein) || 0;
+    const dailyCarbs = Number(config.carbs) || 0;
+    const dailyFat = Number(config.fat) || 0;
+    const totalMealsToday = Math.max(1, day.totalMeals);
+    const perMealTargets = {
+      calories: dailyCalories ? Math.round(dailyCalories / totalMealsToday) : 0,
+      protein: dailyProtein ? Math.round(dailyProtein / totalMealsToday) : 0,
+      carbs: dailyCarbs ? Math.round(dailyCarbs / totalMealsToday) : 0,
+      fat: dailyFat ? Math.round(dailyFat / totalMealsToday) : 0
+    };
 
-          addScoredEntries(deduped);
+    const selection = selectRecipesForDay(perMealTargets, day.totalMeals);
+    const selectedRecipes = selection.selected;
+    const reuseCount = selection.reuseCount;
 
-          attempts += 1;
-        }
+    console.log(`Day ${day.dayAbbr} pool=${hydratedCandidates.length} needed=${day.totalMeals} got=${selectedRecipes.length} reused=${reuseCount}`);
 
-        if (selectedRecipes.length < neededMeals) {
-          let fillAttempts = 0;
-          const MAX_FILL_ATTEMPTS = 3;
-          while (selectedRecipes.length < neededMeals && fillAttempts < MAX_FILL_ATTEMPTS) {
-            if (budgetRef.remaining <= 0) {
-              budgetExceeded = true;
-              break;
-            }
-            if (dayCallStats.randomCalls >= MAX_RANDOM_CALLS_PER_DAY) break;
-            const needed = neededMeals - selectedRecipes.length;
-            const toFetch = Math.min(20, Math.max(needed * 2, 6));
-            const randomBatch = await fetchRandomRecipes(toFetch, isVegetarian, budgetRef, dayCallStats);
-            const vegetarianBatch = filterVegetarian(randomBatch, isVegetarian);
-            const hydratedBatch = await hydrateNutrition(vegetarianBatch, isVegetarian, nutritionLogContext, budgetRef, dayCallStats);
-            const nutritionReady = hydratedBatch.filter(r => r?.nutritionData);
-            const deduped = nutritionReady.filter(r => r?.id && !seenIds.has(r.id) && !usedRecipeIdsGlobal.has(r.id));
-            const beforeFill = selectedRecipes.length;
-            addScoredEntries(deduped);
-            filledFromRandomCount += (selectedRecipes.length - beforeFill);
-            fillAttempts += 1;
-          }
-        }
+    for (let i = 0; i < day.mealTimes.length; i++) {
+      const time = day.mealTimes[i];
+      const selected = selectedRecipes[i];
+      const recipe = selected?.recipe;
+      if (!recipe?.nutritionData) continue;
+      meals.push({
+        id: recipe.id,
+        title: recipe.title,
+        time,
+        type: "normal",
+        image: recipe.image ?? null,
+        pantryMatches: selected?.pantryMatches ?? [],
+        pantryMatchCount: selected?.pantryMatchCount ?? 0,
+        ingredients: Array.isArray(recipe.extendedIngredients)
+          ? recipe.extendedIngredients.map(ing => ing.name)
+          : [],
+        macros: recipe.nutritionData,
+        source: "spoonacular"
+      });
+    }
 
-        if (selectedRecipes.length < neededMeals) {
-          let emergencyAttempts = 0;
-          const MAX_EMERGENCY_ATTEMPTS = 2;
-          while (selectedRecipes.length < neededMeals && emergencyAttempts < MAX_EMERGENCY_ATTEMPTS) {
-            if (budgetRef.remaining <= 0) {
-              budgetExceeded = true;
-              break;
-            }
-            if (dayCallStats.randomCalls >= MAX_RANDOM_CALLS_PER_DAY) break;
-            const needed = neededMeals - selectedRecipes.length;
-            const toFetch = Math.min(20, Math.max(needed * 2, 6));
-            const randomBatch = await fetchRandomRecipes(toFetch, isVegetarian, budgetRef, dayCallStats);
-            const vegetarianBatch = filterVegetarian(randomBatch, isVegetarian);
-            const hydratedBatch = await hydrateNutrition(vegetarianBatch, isVegetarian, nutritionLogContext, budgetRef, dayCallStats);
-            const nutritionReady = hydratedBatch.filter(r => r?.nutritionData && r?.id && !seenIds.has(r.id));
-            const beforeFill = selectedRecipes.length;
-            addScoredEntries(nutritionReady, true);
-            filledFromRandomCount += (selectedRecipes.length - beforeFill);
-            emergencyAttempts += 1;
-          }
-        }
+    if (includeSnack && selectedRecipes[day.mealTimes.length]) {
+      const mealMins = day.mealTimes.map(t => timeToMinutes(t)).filter(m => m !== null).sort((a, b) => a - b);
+      let snackMins = mealMins.length >= 2
+        ? Math.round((mealMins[0] + mealMins[mealMins.length - 1]) / 2)
+        : (mealMins[0] ?? (15 * 60));
 
-        if (isVegetarian) {
-          vegetarianPoolCount += selectedRecipes.length;
-        }
-      } catch (err) {
-        if (err?.message === "BUDGET_EXCEEDED") {
-          budgetExceeded = true;
-          console.warn(`Budget exceeded while fetching recipes for ${abbr}`);
-        } else {
-          console.error(`Failed to fetch recipes for ${abbr}:`, err);
-          return {
-            day: abbr,
-            date: planDay.dateISO,
-            meals: []
-          };
-        }
+      if (day.isTrainingDay && snackMins >= day.trainingMins && snackMins < day.trainingMins + TRAINING_BUFFER) {
+        snackMins = day.trainingMins + TRAINING_BUFFER + 30;
       }
 
-      if (selectedRecipes.length < 1) {
-        console.warn(`No recipes found for ${abbr} after ${attempts} attempts`);
-        return {
-          day: abbr,
-          date: planDay.dateISO,
-          meals: []
-        };
-      }
-
-      console.log(
-        `Day ${abbr} availableFoodsCount=${availableFoodsCount} ` +
-        `usedComplexSearch=${useComplexSearch} selectedCount=${selectedRecipes.length} ` +
-        `filledFromRandomCount=${filledFromRandomCount}`
-      );
-
-      /* ───────── CREATE MEALS FROM RECIPES ───────── */
-      for (let i = 0; i < mealTimes.length; i++) {
-        const time = mealTimes[i];
-        const mins = timeToMinutes(time);
-        const type = "normal";
-
-        const selected = selectedRecipes[i];
-        const recipe = selected?.recipe ?? selectedRecipes?.[i]?.recipe;
-        if (!recipe) {
-          console.warn(`Recipe not available for ${abbr} meal index ${i}`);
-          continue;
-        }
-
-        const ingredients = Array.isArray(recipe.extendedIngredients) 
-          ? recipe.extendedIngredients.map(ing => ing.name) 
-          : [];
-
-        const macros = recipe.nutritionData;
-        if (!macros) {
-          console.warn(`Nutrition missing for ${abbr} meal index ${i}`);
-          continue;
-        }
-
-        const pantryMatches = selected?.pantryMatches ?? (availableFoods.length ? computePantryMatches(recipe, availableFoods) : []);
-        const pantryMatchCount = Number.isFinite(selected?.pantryMatchCount)
-          ? selected.pantryMatchCount
-          : pantryMatches.length;
-
+      const snackSelected = selectedRecipes[day.mealTimes.length];
+      const snackRecipe = snackSelected?.recipe;
+      if (snackRecipe?.nutritionData) {
         meals.push({
-          id: recipe.id,
-          title: recipe.title,
-          time,
-          type,
-          image: recipe.image ?? null,
-          pantryMatches,
-          pantryMatchCount,
-          ingredients,
-          macros,
+          id: snackRecipe.id,
+          title: snackRecipe.title,
+          time: minutesToTime(snackMins),
+          type: "snack",
+          image: snackRecipe.image ?? null,
+          pantryMatches: snackSelected?.pantryMatches ?? [],
+          pantryMatchCount: snackSelected?.pantryMatchCount ?? 0,
+          ingredients: Array.isArray(snackRecipe.extendedIngredients)
+            ? snackRecipe.extendedIngredients.map(ing => ing.name)
+            : [],
+          macros: snackRecipe.nutritionData,
           source: "spoonacular"
         });
       }
+    }
 
-      /* ───────── OPTIONAL SNACK ───────── */
-      if (includeSnack && selectedRecipes[mealTimes.length]) {
-        const mealMins = mealTimes.map(t => timeToMinutes(t)).filter(m => m !== null).sort((a, b) => a - b);
-        let snackMins = mealMins.length >= 2
-          ? Math.round((mealMins[0] + mealMins[mealMins.length - 1]) / 2)
-          : (mealMins[0] ?? (15 * 60));
-
-        if (isTrainingDay && snackMins >= trainingMins && snackMins < trainingMins + TRAINING_BUFFER) {
-          snackMins = trainingMins + TRAINING_BUFFER + 30;
+    if (meals.length) {
+      meals.forEach(m => { if (m.type !== "snack") m.type = "normal"; });
+      if (day.isTrainingDay) {
+        const sortedMeals = meals
+          .filter(m => m.type !== "snack")
+          .slice()
+          .sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
+        let preCandidate = null;
+        for (const meal of sortedMeals) {
+          const mins = timeToMinutes(meal.time);
+          if (mins !== null && mins < day.trainingMins) preCandidate = meal;
         }
+        if (!preCandidate) preCandidate = sortedMeals[0];
+        if (preCandidate) preCandidate.type = "pre-workout";
 
-        const snackSelected = selectedRecipes[mealTimes.length];
-        const snackRecipe = snackSelected?.recipe;
-        if (!snackRecipe) {
-          console.warn(`Snack recipe not available for ${abbr}`);
-        } else {
-          const snackMacros = snackRecipe.nutritionData;
-          if (!snackMacros) {
-            console.warn(`Nutrition missing for ${abbr} snack`);
-          } else {
-            const snackPantryMatches = snackSelected?.pantryMatches ?? (availableFoods.length ? computePantryMatches(snackRecipe, availableFoods) : []);
-            const snackPantryMatchCount = Number.isFinite(snackSelected?.pantryMatchCount)
-              ? snackSelected.pantryMatchCount
-              : snackPantryMatches.length;
-          meals.push({
-              id: snackRecipe.id,
-              title: snackRecipe.title,
-              time: minutesToTime(snackMins),
-              type: "snack",
-              image: snackRecipe.image ?? null,
-              pantryMatches: snackPantryMatches,
-              pantryMatchCount: snackPantryMatchCount,
-              ingredients: Array.isArray(snackRecipe.extendedIngredients)
-                ? snackRecipe.extendedIngredients.map(ing => ing.name)
-                : [],
-              macros: snackMacros,
-              source: "spoonacular"
-            });
-          }
-        }
-      }
-
-      /* ───────── ASSIGN PRE/POST WORKOUT TYPES ───────── */
-      if (meals.length) {
-        meals.forEach(m => { if (m.type !== "snack") m.type = "normal"; });
-
-        if (isTrainingDay) {
-          const sortedMeals = meals
-            .filter(m => m.type !== "snack")
-            .slice()
-            .sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
-          let preCandidate = null;
-
-          for (const meal of sortedMeals) {
-            const mins = timeToMinutes(meal.time);
-            if (mins !== null && mins < trainingMins) preCandidate = meal;
-          }
-
-          if (!preCandidate) preCandidate = sortedMeals[0];
-          if (preCandidate) preCandidate.type = "pre-workout";
-
-          const postCandidate = sortedMeals.find(m => {
-            const mins = timeToMinutes(m.time);
-            return mins !== null && mins >= trainingMins + TRAINING_BUFFER;
-          });
-
-          if (postCandidate && postCandidate !== preCandidate) {
-            postCandidate.type = "post-workout";
-          }
-        }
-      }
-
-      /* ───────── DAILY TOTAL CHECK & OPTIONAL SWAP ───────── */
-      const sumCalories = meals.reduce((sum, m) => sum + (m.macros?.calories || 0), 0);
-      const deviation = Math.round(sumCalories - dailyCalories);
-
-      if (Math.abs(deviation) > 150 && selectedRecipes.length) {
-        let worstIndex = -1;
-        let worstDistance = -1;
-        meals.forEach((m, idx) => {
-          const dist = nutritionDistanceScore(m.macros, perMealTargets);
-          if (dist > worstDistance) {
-            worstDistance = dist;
-            worstIndex = idx;
-          }
+        const postCandidate = sortedMeals.find(m => {
+          const mins = timeToMinutes(m.time);
+          return mins !== null && mins >= day.trainingMins + TRAINING_BUFFER;
         });
-
-        const usedIds = new Set(meals.map(m => m.id).filter(Boolean));
-        const bestCandidate = selectedRecipes.reduce((best, entry) => {
-          const candidate = entry.recipe;
-          if (!candidate?.nutritionData) return best;
-          if (usedIds.has(candidate.id)) return best;
-          if (isVegetarian && candidate.vegetarian !== true) return best;
-          const dist = nutritionDistanceScore(candidate.nutritionData, perMealTargets);
-          if (!best || dist < best.dist) return { recipe: candidate, dist };
-          return best;
-        }, null);
-
-        if (bestCandidate && worstIndex >= 0 && bestCandidate.dist < worstDistance) {
-          const replacement = bestCandidate.recipe;
-          const pantryMatches = availableFoods.length ? computePantryMatches(replacement, availableFoods) : [];
-          meals[worstIndex] = {
-            ...meals[worstIndex],
-            id: replacement.id,
-            title: replacement.title,
-            image: replacement.image ?? null,
-            ingredients: Array.isArray(replacement.extendedIngredients)
-              ? replacement.extendedIngredients.map(ing => ing.name)
-              : [],
-            pantryMatches,
-            pantryMatchCount: pantryMatches.length,
-            macros: replacement.nutritionData,
-            source: "spoonacular"
-          };
-          usedRecipeIdsGlobal.add(replacement.id);
+        if (postCandidate && postCandidate !== preCandidate) {
+          postCandidate.type = "post-workout";
         }
       }
+    }
 
-      const finalSumCalories = meals.reduce((sum, m) => sum + (m.macros?.calories || 0), 0);
-      const finalDeviation = Math.round(finalSumCalories - dailyCalories);
-      console.log(`Day ${abbr} targetCalories=${dailyCalories} sumCalories=${finalSumCalories} deviation=${finalDeviation}`);
-      console.log(
-        `Day ${abbr} randomCalls=${dayCallStats.randomCalls} complexCalls=${dayCallStats.complexCalls} ` +
-        `bulkCalls=${dayCallStats.bulkCalls} budgetLeft=${budgetRef.remaining} finalMeals=${meals.length}`
-      );
-
-        return {
-          day: abbr,
-          date: planDay.dateISO,
-          meals
-        };
-      } catch (err) {
-        if (err?.message === "BUDGET_EXCEEDED") {
-          console.warn(`Budget exceeded while generating ${abbr}`);
-        } else {
-          console.error('Error generating plan for', abbr, err);
-        }
-        return {
-          day: abbr,
-          date: planDay.dateISO,
-          meals: []
-        };
-      }
-  };
-
-  for (const planDay of planDays) {
-    const dayPlan = await generateDayPlan(planDay);
-    weekPlan.push(dayPlan);
+    weekPlan.push({
+      day: day.dayAbbr,
+      date: day.dateISO,
+      meals
+    });
+    mealsTotal += meals.length;
   }
 
-  console.log(
-    `Vegetarian mode: ${isVegetarian}; fallback: ${vegetarianFallbackUsed}; veg recipes after filter: ${vegetarianPoolCount}`
-  );
-  console.log("Spoonacular budget left:", requestBudget);
-
+  console.log("Weekly plan generated", { mealsTotal });
   return weekPlan;
 }
 
